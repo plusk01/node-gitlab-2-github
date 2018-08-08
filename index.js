@@ -91,6 +91,13 @@ async function migrate() {
     password: settings.github.token
   });
 
+  // print the current rate info
+  let result = await github.misc.getRateLimit();
+  console.log("====================================");
+  console.log("Beginning GitLab to GitHub Migration");
+  console.log("  Rate Limit: " + result.data.rate.remaining + " / " + result.data.rate.limit);
+  console.log("====================================");
+
   //
   // Sequentially transfer repo things
   //
@@ -104,7 +111,13 @@ async function migrate() {
   // Transfer issues with their comments
   await transferIssues(settings.github.owner, settings.github.repo, settings.gitlab.projectId);
 
+  // Transfer merge requests with their comments
+  await transferMergeRequests(settings.github.owner, settings.github.repo, settings.gitlab.projectId);
+
   console.log("\n\nTransfer complete!\n\n");
+
+  result = await github.misc.getRateLimit();
+  console.log("  Rate Limit: " + result.data.rate.remaining + " / " + result.data.rate.limit);
 }
 
 // ----------------------------------------------------------------------------
@@ -270,6 +283,49 @@ async function transferIssues(owner, repo, projectId) {
 // ----------------------------------------------------------------------------
 
 /**
+ * Transfer GitLab merge requests to GitHub pull requests with comments
+ */
+async function transferMergeRequests(owner, repo, projectId) {
+    // get an array of GitLab merge requests
+    let mergeRequests = await gitlab.MergeRequests.all({projectId: 188});
+
+    // sort merge requests in ascending order of when they were created (by id)
+    mergeRequests = mergeRequests.sort((a, b) => a.id - b.id);
+
+    // get an array of GitHub pull requests (likely to be empty)
+    let ghPullRequests = await getAllGHPullRequests(owner, repo);
+
+    inform("Transferring " + mergeRequests.length.toString() + " Merge Requests");
+
+    //
+    // Create GitHub pull request for each GitLab merge request
+    //
+
+    // if a GitLab merge request does not exist in GitHub repo, create it -- along with comments.
+    for (let mr of mergeRequests) {
+      // try to find a GitHub pull request that already exists for this GitLab merge request
+      let ghPR = ghPullRequests.find(pr => pr.title === mr.title);
+      if (!ghPR) {
+        console.log("Creating PR from !" + mr.iid + " - " + mr.title);
+        try {
+
+          // process asynchronous code in sequence -- treats the code sort of like blocking
+          await createPRAndComments(settings.github.owner, settings.github.repo, mr);
+
+        } catch (err) {
+          console.error("Could not create PR from !" + mr.iid + " - " + mr.title);
+          console.error(err);
+        }
+      } else {
+        console.log("Already exists as PR" + ghPR.number + " (" + mr.iid + " - " + mr.title + ")");
+        // updateIssueState(ghPR, mr);
+      }
+    };
+}
+
+// ----------------------------------------------------------------------------
+
+/**
  * Get a list of all GitHub milestones currently in new repo
  */
 async function getAllGHMilestones(owner, repo) {
@@ -348,6 +404,35 @@ async function getAllGHIssues(owner, repo) {
 /**
  *
  */
+async function getAllGHPullRequests(owner, repo) {
+  try {
+    // get an array of GitHub PRs for the new repo
+    let result = await getAllGHIssues(owner, repo);
+
+    // extract the PR name and put into a new array
+    let prs = result.reduce((arr, x) => {
+      if (x.pull_request) {
+        arr.push({
+          number: x.number,
+          title: x.title
+        });
+      }
+      return arr;
+    }, []);
+
+    return prs;
+  } catch (err) {
+    console.error("Could not access all GitHub pull requests!");
+    console.error(err);
+    process.exit(1);
+  }
+}
+
+// ----------------------------------------------------------------------------
+
+/**
+ *
+ */
 async function createIssueAndComments(owner, repo, milestones, issue) {
 
   // create the issue in GitHub
@@ -359,6 +444,83 @@ async function createIssueAndComments(owner, repo, milestones, issue) {
 
   // make sure to close the GitHub issue if it is closed in GitLab
   await updateIssueState(ghIssue, issue);
+}
+
+// ----------------------------------------------------------------------------
+
+/**
+ *
+ */
+async function createPRAndComments(owner, repo, mr) {
+
+  // TEMP
+  if (mr.iid != 1) return;
+  
+  // We currently don't support transferring rejected or locked MRs
+  // This is because we can't guarantee that the appropriate SHA/commit exists.
+  if (mr.state != 'merged' && mr.state != 'open') return;
+
+  //
+  // Setup branches for this pull request
+  //
+
+  // Note: The folowing assumes that a merge commit (i.e., --no-ff) was created/
+  // This is always the case when merged via the GitLab interface.
+  // see: http://arjanvandergaag.nl/blog/clarify-git-history-with-merge-commits.html
+
+  // create a two new branches:
+  //  1) the base of the merge commit, e.g, MR12-base
+  //  2) the branch that was merged that because the merge commit
+
+  let baseRef = 'MR'+mr.iid+'-'+mr.target_branch+'-base';
+  let headRef = 'MR'+mr.iid+'-'+mr.source_branch+'-head';
+
+  let headBranch = await createGHBranch(owner, repo, headRef, mr.sha);
+
+  let commitInfo = await gitlab.Commits.show(settings.gitlab.projectId, mr.merge_commit_sha);
+  let parentCommits = commitInfo.parent_ids.filter(sha => sha != mr.sha);
+  let parentCommit = (parentCommits.length == 1) ? parentCommits[0] : null;
+
+  let baseBranch = await createGHBranch(owner, repo, baseRef, parentCommit);
+
+  //
+  // Create the pull request
+  //
+
+  // create the GitHub pull request
+  let ghPRData = await createPR(owner, repo, mr, headRef, baseRef);
+  let ghPR = ghPRData.data;
+
+  // add any comments/notes associated with this MR
+  // await createPRComments(ghPr, mr);
+
+  // make sure to close the GitHub PR if it is closed in GitLab
+  // await updatePRState(ghPr, mr);
+
+  //
+  // Remove the branches that we had to set up
+  //
+}
+
+// ----------------------------------------------------------------------------
+
+async function createGHBranch(owner, repo, name, sha) {
+  try {
+
+    // create ref for branch name
+    let ref = 'refs/heads/' + name;
+
+    const result = await github.gitdata.createReference({owner, repo, ref, sha})
+
+    return result;
+  } catch (err) {
+    if (err.message.indexOf('Reference already exists') > 0) {
+          console.log("Branch '" + name + "' already exists!");
+    } else {
+      console.error("Could not create branch '" + name + "' at " + sha);
+      console.error(err);
+    }
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -497,6 +659,30 @@ async function updateIssueState(ghIssue, issue) {
 // ----------------------------------------------------------------------------
 
 /**
+ *
+ */
+async function createPR(owner, repo, mr, head, base) {
+  // let bodyConverted = convertIssuesAndComments(issue.description, issue);
+
+  let props = {
+    owner: owner,
+    repo: repo,
+    title: mr.title,
+    body: mr.description,
+    head: head, // source_branch ref
+    base: base  // target_branch ref
+  };
+
+  // TODO: after creating the GitHub PR, edit the underlying issue to add
+  // labels, assignees, check for attachments, etc
+
+  // create the GitHub issue from the GitLab issue
+  return github.pullRequests.create(props);
+}
+
+// ----------------------------------------------------------------------------
+
+/**
  * Create a GitHub milestone from a GitLab milestone
  */
 async function createMilestone(owner, repo, milestone) {
@@ -627,7 +813,7 @@ function generateUserProjectRe() {
  * Print out a section heading to let the user know what is happening
  */
 function inform(msg) {
-  console.log("==================================");
+  console.log("====================================");
   console.log(msg)
-  console.log("==================================");
+  console.log("====================================");
 }
